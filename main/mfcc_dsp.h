@@ -12,7 +12,7 @@
 #define NUM_MELS 32
 #define NUM_MFCC 13
 
-void mfcc_init(void);
+void mfcc_dsp_init(void);
 void mfcc_compute(const int16_t* pcm_data, float* out_features);
 
 #endif

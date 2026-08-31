@@ -2,12 +2,18 @@
 #include <string.h>      // Adds declaration for memcpy
 #include <math.h>
 #include "esp_attr.h"
+#include "esp_log.h"
+
+//static const char *TAG = "KWS_MODEL";
 
 // 1. Allocate uninitialized global arrays in PSRAM BSS (Zero DRAM overhead)
 EXT_RAM_BSS_ATTR float fc1_w[MODEL_HIDDEN_SIZE][MODEL_INPUT_SIZE];
 EXT_RAM_BSS_ATTR float fc1_b[MODEL_HIDDEN_SIZE];
 EXT_RAM_BSS_ATTR float fc2_w[MODEL_OUTPUT_SIZE][MODEL_HIDDEN_SIZE];
 EXT_RAM_BSS_ATTR float fc2_b[MODEL_OUTPUT_SIZE];
+
+// Tracker variable to avoid redundant weight initialization
+static bool s_is_initialized = false;
 
 
 static const float fc1_w_init[MODEL_HIDDEN_SIZE][MODEL_INPUT_SIZE] = {
@@ -94,14 +100,49 @@ static const float fc2_b_init[MODEL_OUTPUT_SIZE] = {
   0.1680676f, -0.1676782f, -0.0127866f, 0.2632304f, -0.6852440f, -0.0319713f
 };
 
+// ============================================================================
+// 3. Helper Functions
+// ============================================================================
+static inline float relu(float x) {
+    return x > 0.0f ? x : 0.0f;
+}
+
+static void softmax(const float *input, float *output, int size) {
+    float max_val = input[0];
+    for (int i = 1; i < size; i++) {
+        if (input[i] > max_val) {
+            max_val = input[i];
+        }
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        output[i] = expf(input[i] - max_val);
+        sum += output[i];
+    }
+
+    float inv_sum = 1.0f / (sum + 1e-7f);
+    for (int i = 0; i < size; i++) {
+        output[i] *= inv_sum;
+    }
+}
+
 void kws_model_init(void) {
+    if (s_is_initialized) {
+        //ESP_LOGI(TAG, "Model already initialized in PSRAM");
+        return ;
+    }
+
+    //ESP_LOGI(TAG, "Copying model weights from Flash to PSRAM BSS buffers...");
     // 3. Copy baseline weights from Flash into PSRAM at boot
     memcpy(fc1_w, fc1_w_init, sizeof(fc1_w_init));
     memcpy(fc1_b, fc1_b_init, sizeof(fc1_b_init));
     memcpy(fc2_w, fc2_w_init, sizeof(fc2_w_init));
     memcpy(fc2_b, fc2_b_init, sizeof(fc2_b_init));
+    s_is_initialized = true;
+    //ESP_LOGI(TAG, "Model weights initialized successfully");
 }
-
+/*
 void model_inference(const float* input, float* output) {
     float hidden[MODEL_HIDDEN_SIZE];
     
@@ -121,5 +162,49 @@ void model_inference(const float* input, float* output) {
             sum += hidden[j] * fc2_w[i][j];
         }
         output[i] = sum;
+    }
+}
+*/
+
+void model_inference(const float* input, float* output) {
+    if (!s_is_initialized) {
+        //ESP_LOGE(TAG, "Inference called before kws_model_init!");
+        return;
+    }
+
+    if (input == NULL || output == NULL) {
+        //ESP_LOGE(TAG, "Null pointer passed to model_inference");
+        return;
+    }
+
+    // Layer 1 Activation Buffer (Hidden Layer)
+    float hidden_layer[MODEL_HIDDEN_SIZE];
+
+    // Layer 1: Dense (Input -> Hidden) + ReLU
+    for (int h = 0; h < MODEL_HIDDEN_SIZE; h++) {
+        float sum = fc1_b[h];
+        const float *w_row = fc1_w[h];
+        for (int i = 0; i < MODEL_INPUT_SIZE; i++) {
+            sum += input[i] * w_row[i];
+        }
+        hidden_layer[h] = relu(sum);
+    }
+
+    // Layer 2: Dense (Hidden -> Output Logits)
+    float logits[MODEL_OUTPUT_SIZE];
+    for (int o = 0; o < MODEL_OUTPUT_SIZE; o++) {
+        float sum = fc2_b[o];
+        const float *w_row = fc2_w[o];
+        for (int h = 0; h < MODEL_HIDDEN_SIZE; h++) {
+            sum += hidden_layer[h] * w_row[h];
+        }
+        logits[o] = sum;
+    }
+
+    // Layer 3: Softmax Probability Output
+    //softmax(logits, output, MODEL_OUTPUT_SIZE);
+    // Replace the Softmax call at the end of model_inference with a direct copy loop:
+    for (int o = 0; o < MODEL_OUTPUT_SIZE; o++) {
+        output[o] = logits[o];
     }
 }
