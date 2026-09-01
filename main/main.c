@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -14,8 +15,18 @@
 
 #define PDM_CLK_IO GPIO_NUM_42
 #define PDM_DIN_IO GPIO_NUM_41
+#define VAD_CHUNK_SAMPLES FRAME_STEP
+#define VAD_PRE_ROLL_SAMPLES (SAMPLE_RATE / 4)
+#define VAD_CALIBRATION_CHUNKS 150
+#define VAD_TRIGGER_MARGIN 350.0f
+#define VAD_TRIGGER_PEAK_MULTIPLIER 1.20f
+#define VAD_RELEASE_MULTIPLIER 1.20f
+#define VAD_NOISE_ADAPT_RATE 0.02f
+#define VAD_REQUIRED_CHUNKS 2
+#define VAD_COOLDOWN_MS 1000
 
 static const char *TAG = "KWS_RL_SYSTEM";
+#define VALIDATION_MODE 1
 static const char *WORD_LABELS[MODEL_OUTPUT_SIZE] = {"UP", "DOWN", "LEFT", "RIGHT", "BACK", "GO"};
 
 // Struct passed over FreeRTOS Queue from Core 0 -> Core 1
@@ -29,20 +40,59 @@ static QueueHandle_t xInferenceQueue = NULL;
 static SemaphoreHandle_t xModelMutex = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
 
+static float calculate_rms(const int16_t *samples, size_t sample_count) {
+    double sum_squares = 0.0;
+    for (size_t i = 0; i < sample_count; i++) {
+        sum_squares += (double)samples[i] * samples[i];
+    }
+    return sqrtf((float)(sum_squares / sample_count));
+}
+
+static void update_vad_thresholds(float noise_floor, float noise_peak,
+                                  float *trigger_rms, float *release_rms) {
+    float peak_trigger = noise_peak * VAD_TRIGGER_PEAK_MULTIPLIER;
+    float margin_trigger = noise_floor + VAD_TRIGGER_MARGIN;
+    *trigger_rms = (peak_trigger > margin_trigger) ? peak_trigger : margin_trigger;
+    *release_rms = noise_floor * VAD_RELEASE_MULTIPLIER;
+}
+
 // Softmax Calculation
-static void softmax(const float* input, float* output, int len) {
-    float max_val = input[0];
-    for (int i = 1; i < len; i++) {
-        if (input[i] > max_val) max_val = input[i];
+static int select_top_class(const float *logits, int num_classes, float *confidence_out) {
+    if (!logits || !confidence_out || num_classes <= 0) {
+        return -1;
     }
-    float sum = 0.0f;
-    for (int i = 0; i < len; i++) {
-        output[i] = expf(input[i] - max_val);
-        sum += output[i];
+
+    float max_logit = logits[0];
+    for (int i = 1; i < num_classes; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+        }
     }
-    for (int i = 0; i < len; i++) {
-        output[i] /= sum;
+
+    float denom = 0.0f;
+    float probs[32];
+    if (num_classes > (int)(sizeof(probs) / sizeof(probs[0]))) {
+        return -1;
     }
+
+    for (int i = 0; i < num_classes; ++i) {
+        probs[i] = expf(logits[i] - max_logit);
+        denom += probs[i];
+    }
+
+    int best_idx = 0;
+    float best_prob = 0.0f;
+
+    for (int i = 0; i < num_classes; ++i) {
+        float p = probs[i] / denom;
+        if (p > best_prob) {
+            best_prob = p;
+            best_idx = i;
+        }
+    }
+
+    *confidence_out = best_prob;
+    return best_idx;
 }
 
 static void init_pdm_microphone(void) {
@@ -63,78 +113,131 @@ static void init_pdm_microphone(void) {
     ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
 }
 
+static bool calibrate_vad(int16_t *audio_chunk, float *noise_floor,
+                          float *trigger_rms, float *release_rms) {
+    float noise_sum = 0.0f;
+    float noise_peak = 0.0f;
+    size_t bytes_read = 0;
+
+    ESP_LOGI(TAG, "[VAD] Calibrating ambient noise for 1.5 seconds; remain quiet");
+    for (int chunk = 0; chunk < VAD_CALIBRATION_CHUNKS; chunk++) {
+        esp_err_t result = i2s_channel_read(rx_chan, audio_chunk, sizeof(int16_t) * VAD_CHUNK_SAMPLES,
+                                             &bytes_read, portMAX_DELAY);
+        if (result != ESP_OK || bytes_read != sizeof(int16_t) * VAD_CHUNK_SAMPLES) {
+            ESP_LOGW(TAG, "[VAD] Calibration read failed: result=%d bytes=%u", result, (unsigned)bytes_read);
+            return false;
+        }
+
+        float chunk_rms = calculate_rms(audio_chunk, VAD_CHUNK_SAMPLES);
+        noise_sum += chunk_rms;
+        if (chunk_rms > noise_peak) {
+            noise_peak = chunk_rms;
+        }
+    }
+
+    *noise_floor = noise_sum / VAD_CALIBRATION_CHUNKS;
+    update_vad_thresholds(*noise_floor, noise_peak, trigger_rms, release_rms);
+    ESP_LOGI(TAG, "[VAD] Calibrated: noise=%.2f peak=%.2f trigger=%.2f release=%.2f",
+             *noise_floor, noise_peak, *trigger_rms, *release_rms);
+    return true;
+}
+
 void vCore0_InferenceTask(void *pvParameters) {
     static int16_t raw_pcm[AUDIO_LEN_SAMPLES];
+    static int16_t pre_roll[VAD_PRE_ROLL_SAMPLES];
     static float mfcc_features[MODEL_INPUT_SIZE];
     static float raw_logits[MODEL_OUTPUT_SIZE];
-    static float probabilities[MODEL_OUTPUT_SIZE];
+    int16_t audio_chunk[VAD_CHUNK_SAMPLES];
+    size_t pre_roll_write = 0;
+    int active_chunk_count = 0;
+    bool vad_armed = false;
+    float noise_floor = 0.0f;
+    float trigger_rms = 0.0f;
+    float release_rms = 0.0f;
+    TickType_t next_trigger_tick = 0;
     size_t bytes_read = 0;
 
     mfcc_dsp_init();
+    if (!calibrate_vad(audio_chunk, &noise_floor, &trigger_rms, &release_rms)) {
+        ESP_LOGE(TAG, "[VAD] Calibration failed; inference task stopping");
+        vTaskDelete(NULL);
+        return;
+    }
 
     while (1) {
-        // Read 1 second of clean mono audio data from the PDM mic
-        esp_err_t result = i2s_channel_read(rx_chan, raw_pcm, sizeof(raw_pcm), &bytes_read, portMAX_DELAY);
-        if (result == ESP_OK && bytes_read == sizeof(raw_pcm)) {
-            
-            // 1. Calculate Real-Time Audio Power (Volume RMS)
-            double sum_squares = 0.0;
-            for (int i = 0; i < AUDIO_LEN_SAMPLES; i++) {
-                sum_squares += (double)raw_pcm[i] * raw_pcm[i];
+        esp_err_t result = i2s_channel_read(rx_chan, audio_chunk, sizeof(audio_chunk), &bytes_read, portMAX_DELAY);
+        if (result != ESP_OK || bytes_read != sizeof(audio_chunk)) {
+            ESP_LOGW(TAG, "[VAD] Audio read failed: result=%d bytes=%u", result, (unsigned)bytes_read);
+            continue;
+        }
+
+        for (int i = 0; i < VAD_CHUNK_SAMPLES; i++) {
+            pre_roll[pre_roll_write] = audio_chunk[i];
+            pre_roll_write = (pre_roll_write + 1) % VAD_PRE_ROLL_SAMPLES;
+        }
+        float chunk_rms = calculate_rms(audio_chunk, VAD_CHUNK_SAMPLES);
+
+        if (!vad_armed) {
+            if (chunk_rms <= release_rms) {
+                vad_armed = true;
+                active_chunk_count = 0;
+
+                noise_floor += VAD_NOISE_ADAPT_RATE * (chunk_rms - noise_floor);
+                update_vad_thresholds(noise_floor, noise_floor, &trigger_rms, &release_rms);
             }
-            float audio_rms = sqrtf((float)(sum_squares / AUDIO_LEN_SAMPLES));
+            continue;
+        }
 
-            // 2. Execute DSP MFCC Feature Extraction across overlapping windows
-            int frame_count = 0;
-            int stride = 160; 
-            for (int offset = 0; offset <= (AUDIO_LEN_SAMPLES - FRAME_LEN); offset += stride) {
-                if (frame_count >= 97) break; 
+        if (chunk_rms < trigger_rms) {
+            active_chunk_count = 0;
+            continue;
+        }
 
-                float temp_mfcc[NUM_MFCC_COEFS];
-                mfcc_compute(&raw_pcm[offset], temp_mfcc);
+        active_chunk_count++;
+        if (active_chunk_count < VAD_REQUIRED_CHUNKS || (int32_t)(xTaskGetTickCount() - next_trigger_tick) < 0) {
+            continue;
+        }
 
-                // Distribute features to match PyTorch's flattened layout order
-                for (int coef_idx = 0; coef_idx < NUM_MFCC_COEFS; coef_idx++) {
-                    
-                    // 🟢 ORTHO-NORMALIZATION CORRECTION LAYER:
-                    // Adjusts raw C coefficients to match Torchaudio's internal norm='ortho' math.
-                    // Uses 32.0f directly to align with your PyTorch N_MELS setup.
-                    if (coef_idx == 0) {
-                        temp_mfcc[coef_idx] *= sqrtf(1.0f / (4.0f * 32.0f));
-                    } else {
-                        temp_mfcc[coef_idx] *= sqrtf(2.0f / 32.0f);
-                    }
+        for (int i = 0; i < VAD_PRE_ROLL_SAMPLES; i++) {
+            raw_pcm[i] = pre_roll[(pre_roll_write + i) % VAD_PRE_ROLL_SAMPLES];
+        }
 
-                    int target_flat_index = (coef_idx * 97) + frame_count;
-                    mfcc_features[target_flat_index] = temp_mfcc[coef_idx];
-                }
-                frame_count++;
+        int captured_samples = VAD_PRE_ROLL_SAMPLES;
+        while (captured_samples < AUDIO_LEN_SAMPLES) {
+            result = i2s_channel_read(rx_chan, audio_chunk, sizeof(audio_chunk), &bytes_read, portMAX_DELAY);
+            if (result != ESP_OK || bytes_read != sizeof(audio_chunk)) {
+                ESP_LOGW(TAG, "[VAD] Capture failed: result=%d bytes=%u", result, (unsigned)bytes_read);
+                break;
             }
+            memcpy(&raw_pcm[captured_samples], audio_chunk, sizeof(audio_chunk));
+            captured_samples += VAD_CHUNK_SAMPLES;
+        }
 
-            // Match Torchaudio raw scale clipping boundaries 
-            for (int i = 0; i < MODEL_INPUT_SIZE; i++) {
-                if (mfcc_features[i] < -120.0f) {
-                    mfcc_features[i] = -120.0f;
-                }
-            }
+        vad_armed = false;
+        active_chunk_count = 0;
+        next_trigger_tick = xTaskGetTickCount() + pdMS_TO_TICKS(VAD_COOLDOWN_MS);
 
-            // 3. Thread-safe access to Shared Model Weights in SRAM
+        if (captured_samples == AUDIO_LEN_SAMPLES) {
+            float audio_rms = calculate_rms(raw_pcm, AUDIO_LEN_SAMPLES);
+            ESP_LOGI(TAG, "[VAD] Triggered at %.2f RMS (threshold %.2f); classifying a 1.0 s clip",
+                     chunk_rms, trigger_rms);
+
+            // Extract all frames together so the 80 dB torchaudio floor is
+            // calculated from the same one-second clip used for inference.
+            mfcc_compute_batch(raw_pcm, mfcc_features);
+
+            // Thread-safe access to Shared Model Weights in SRAM
             if (xSemaphoreTake(xModelMutex, portMAX_DELAY) == pdTRUE) {
                 model_inference(mfcc_features, raw_logits);
                 xSemaphoreGive(xModelMutex);
             }
 
-            // Squash raw outputs to probabilities
-            softmax(raw_logits, probabilities, MODEL_OUTPUT_SIZE);
-
             // Find top prediction index and confidence value
-            int max_idx = 0;
-            float max_conf = probabilities[0];
-            for (int i = 1; i < MODEL_OUTPUT_SIZE; i++) {
-                if (probabilities[i] > max_conf) {
-                    max_conf = probabilities[i];
-                    max_idx = i;
-                }
+            float max_conf = 0.0f;
+            int max_idx = select_top_class(raw_logits, MODEL_OUTPUT_SIZE, &max_conf);
+            if (max_idx < 0) {
+                max_idx = 0;
+                max_conf = 0.0f;
             }
 
             // Calculate feature boundaries for tracking trends
@@ -145,7 +248,7 @@ void vCore0_InferenceTask(void *pvParameters) {
                 if (mfcc_features[i] > feat_max) feat_max = mfcc_features[i];
             }
 
-            // 4. Print Core Metrics Dashboard
+            // Print Core Metrics Dashboard
             ESP_LOGI(TAG, "--------------------------------------------------");
             ESP_LOGI(TAG, "[MIC] Volume RMS: %.2f", audio_rms);
             ESP_LOGI(TAG, "[DSP] MFCC Range: [Min: %.2f, Max: %.2f]", feat_min, feat_max);
@@ -174,11 +277,15 @@ void vCore0_InferenceTask(void *pvParameters) {
 // Core 1 Task: Contextual Policy Gradient (REINFORCE Algorithm)
 void vCore1_RLTask(void *pvParameters) {
     inference_msg_t msg;
-    //float learning_rate = 0.001f;
 
     while (1) {
         if (xQueueReceive(xInferenceQueue, &msg, portMAX_DELAY) == pdTRUE) {
-            
+#if VALIDATION_MODE
+            ESP_LOGW(TAG, "[VALIDATION] RL disabled. Observing logits only.");
+            ESP_LOGI(TAG, "[VALIDATION] Candidate label: %s (confidence %.2f%%)",
+                     WORD_LABELS[msg.label_idx], msg.confidence * 100.0f);
+            continue;
+#else
             // Simulated Reward Environment Policy logic:
             // High confidence (>80%) grants Positive Reward (+1.0), lower triggers Penalty (-1.0)
             float reward = (msg.confidence > 0.80f) ? 1.0f : -1.0f;
@@ -206,11 +313,15 @@ void vCore1_RLTask(void *pvParameters) {
             } else {
                 ESP_LOGI(TAG, "[Core 1 RL] Optimal Prediction Verified (Reward: +1.0). No Weight Shift Required.");
             }
+#endif
         }
     }
 }
 
 void app_main(void) {
+    ESP_LOGI(TAG, "[VALIDATION] word order = [UP, DOWN, LEFT, RIGHT, BACK, GO]");
+    ESP_LOGI(TAG, "[VALIDATION] model dims = input=%d hidden=%d output=%d", MODEL_INPUT_SIZE, MODEL_HIDDEN_SIZE, MODEL_OUTPUT_SIZE);
+    ESP_LOGI(TAG, "[VALIDATION] expected feature layout = 13 MFCC x 97 frames -> flattened length 1261");
 
     kws_model_init();
     

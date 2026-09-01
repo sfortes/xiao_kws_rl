@@ -4,7 +4,7 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 
-//static const char *TAG = "KWS_MODEL";
+static const char *TAG = "KWS_MODEL";
 
 // 1. Allocate uninitialized global arrays in PSRAM BSS (Zero DRAM overhead)
 EXT_RAM_BSS_ATTR float fc1_w[MODEL_HIDDEN_SIZE][MODEL_INPUT_SIZE];
@@ -129,18 +129,31 @@ static void softmax(const float *input, float *output, int size) {
 
 void kws_model_init(void) {
     if (s_is_initialized) {
-        //ESP_LOGI(TAG, "Model already initialized in PSRAM");
-        return ;
+        ESP_LOGI(TAG, "Model already initialized in PSRAM");
+        return;
     }
 
-    //ESP_LOGI(TAG, "Copying model weights from Flash to PSRAM BSS buffers...");
-    // 3. Copy baseline weights from Flash into PSRAM at boot
+    ESP_LOGI(TAG, "Starting weight initialization...");
+    
+    // Copy baseline weights from Flash into PSRAM at boot
+    ESP_LOGI(TAG, "Copying fc1_w (size=%d bytes)...", sizeof(fc1_w_init));
     memcpy(fc1_w, fc1_w_init, sizeof(fc1_w_init));
+    ESP_LOGI(TAG, "fc1_w[0][0] = %f", fc1_w[0][0]);
+    
+    ESP_LOGI(TAG, "Copying fc1_b (size=%d bytes)...", sizeof(fc1_b_init));
     memcpy(fc1_b, fc1_b_init, sizeof(fc1_b_init));
+    ESP_LOGI(TAG, "fc1_b[0] = %f", fc1_b[0]);
+    
+    ESP_LOGI(TAG, "Copying fc2_w (size=%d bytes)...", sizeof(fc2_w_init));
     memcpy(fc2_w, fc2_w_init, sizeof(fc2_w_init));
+    ESP_LOGI(TAG, "fc2_w[0][0] = %f", fc2_w[0][0]);
+    
+    ESP_LOGI(TAG, "Copying fc2_b (size=%d bytes)...", sizeof(fc2_b_init));
     memcpy(fc2_b, fc2_b_init, sizeof(fc2_b_init));
+    ESP_LOGI(TAG, "fc2_b[0] = %f", fc2_b[0]);
+    
     s_is_initialized = true;
-    //ESP_LOGI(TAG, "Model weights initialized successfully");
+    ESP_LOGI(TAG, "Model weights initialized successfully in PSRAM");
 }
 /*
 void model_inference(const float* input, float* output) {
@@ -168,12 +181,12 @@ void model_inference(const float* input, float* output) {
 
 void model_inference(const float* input, float* output) {
     if (!s_is_initialized) {
-        //ESP_LOGE(TAG, "Inference called before kws_model_init!");
+        ESP_LOGE(TAG, "Inference called before kws_model_init!");
         return;
     }
 
     if (input == NULL || output == NULL) {
-        //ESP_LOGE(TAG, "Null pointer passed to model_inference");
+        ESP_LOGE(TAG, "Null pointer passed to model_inference");
         return;
     }
 
@@ -201,9 +214,7 @@ void model_inference(const float* input, float* output) {
         logits[o] = sum;
     }
 
-    // Layer 3: Softmax Probability Output
-    //softmax(logits, output, MODEL_OUTPUT_SIZE);
-    // Replace the Softmax call at the end of model_inference with a direct copy loop:
+    // Layer 3: Softmax Probability Output (now just copy logits)
     for (int o = 0; o < MODEL_OUTPUT_SIZE; o++) {
         output[o] = logits[o];
     }

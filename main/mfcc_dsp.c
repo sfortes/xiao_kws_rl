@@ -14,22 +14,13 @@ static const char *TAG = "MFCC_DSP";
 
 // Local Macros (Non-conflicting with mfcc_dsp.h)
 #define FFT_SIZE        512
-#define NUM_MEL_FILTERS 26
+#define NUM_MEL_FILTERS 32
 #define NUM_MFCC_COEFS  13
-#define PREEMPH_ALPHA   0.97f
-
-// State Structures
-typedef struct {
-    float alpha;
-    float prev_x;
-    float prev_y;
-} dc_blocker_t;
-
-static dc_blocker_t s_dc_filter;
 static bool s_dsp_initialized = false;
-static float s_hamming_window[FRAME_LEN];
+static float s_window[FRAME_LEN];
 static float s_mel_filterbank[NUM_MEL_FILTERS][(FFT_SIZE / 2) + 1];
 static float s_dct_matrix[NUM_MFCC_COEFS][NUM_MEL_FILTERS];
+static float s_mel_db[NUM_FRAMES][NUM_MEL_FILTERS];
 
 // Helper Functions: Hz <-> Mel Conversion
 static inline float hz_to_mel(float hz) {
@@ -43,28 +34,6 @@ static inline float mel_to_hz(float mel) {
 // ----------------------------------------------------------------------------
 // 1. Core DSP Sub-routines
 // ----------------------------------------------------------------------------
-static void dc_blocker_init(dc_blocker_t *filter, float alpha) {
-    filter->alpha = alpha;
-    filter->prev_x = 0.0f;
-    filter->prev_y = 0.0f;
-}
-
-static void dc_blocker_process(dc_blocker_t *filter, float *buffer, size_t samples) {
-    float a = filter->alpha;
-    float x_prev = filter->prev_x;
-    float y_prev = filter->prev_y;
-
-    for (size_t i = 0; i < samples; i++) {
-        float x = buffer[i];
-        float y = x - x_prev + (a * y_prev);
-        x_prev = x;
-        y_prev = y;
-        buffer[i] = y;
-    }
-    filter->prev_x = x_prev;
-    filter->prev_y = y_prev;
-}
-
 // In-place Radix-2 Cooley-Tukey FFT
 static void fft_radix2(float *real, float *imag, int n) {
     int j = 0;
@@ -124,47 +93,51 @@ void mfcc_dsp_init(void) {
         return;
     }
 
-    // DC Blocker Setup (~20Hz cutoff @ 16kHz)
-    dc_blocker_init(&s_dc_filter, 0.985f);
-
-    // 1. Pre-calculate Hamming Window
+    // 1. Pre-calculate PyTorch's periodic Hann window.
     for (int i = 0; i < FRAME_LEN; i++) {
-        s_hamming_window[i] = 0.54f - 0.46f * cosf((2.0f * M_PI * i) / (FRAME_LEN - 1));
+        s_window[i] = 0.5f - 0.5f * cosf((2.0f * M_PI * i) / FRAME_LEN);
     }
 
-    // 2. Pre-calculate Triangular Mel Filterbank
+    // 2. Pre-calculate the torchaudio-style triangular Mel filterbank.
+    // This matches Librosa/torchaudio's `melscale_fbanks` construction using
+    // `torch.linspace(0, sample_rate / 2, n_freqs)` and a `n_mels + 2` point mel grid.
     memset(s_mel_filterbank, 0, sizeof(s_mel_filterbank));
-    float low_mel = hz_to_mel(300.0f);     // Voice band bottom
-    float high_mel = hz_to_mel(8000.0f);   // Voice band top cutoff
-    float mel_step = (high_mel - low_mel) / (NUM_MEL_FILTERS + 1);
-
-    int bin_points[NUM_MEL_FILTERS + 2];
+    float m_min = hz_to_mel(0.0f);
+    float m_max = hz_to_mel((float)SAMPLE_RATE / 2.0f);
+    float mel_pts[NUM_MEL_FILTERS + 2];
     for (int i = 0; i < NUM_MEL_FILTERS + 2; i++) {
-        float hz = mel_to_hz(low_mel + i * mel_step);
-        bin_points[i] = (int)floorf((FFT_SIZE + 1) * hz / (float)SAMPLE_RATE);
+        float mel = m_min + ((m_max - m_min) * (float)i) / (NUM_MEL_FILTERS + 1);
+        mel_pts[i] = mel_to_hz(mel);
     }
 
-    for (int m = 1; m <= NUM_MEL_FILTERS; m++) {
-        int left = bin_points[m - 1];
-        int center = bin_points[m];
-        int right = bin_points[m + 1];
+    for (int m = 0; m < NUM_MEL_FILTERS; m++) {
+        float left = mel_pts[m];
+        float center = mel_pts[m + 1];
+        float right = mel_pts[m + 2];
 
-        for (int k = left; k < center; k++) {
-            if (center != left) {
-                s_mel_filterbank[m - 1][k] = (float)(k - left) / (center - left);
-            }
-        }
-        for (int k = center; k < right; k++) {
-            if (right != center) {
-                s_mel_filterbank[m - 1][k] = (float)(right - k) / (right - center);
+        for (int k = 0; k <= FFT_SIZE / 2; k++) {
+            float freq_hz = ((float)k * (float)SAMPLE_RATE) / (float)FFT_SIZE;
+            if (freq_hz >= left && freq_hz <= center) {
+                if (center != left) {
+                    s_mel_filterbank[m][k] = (freq_hz - left) / (center - left);
+                }
+            } else if (freq_hz > center && freq_hz <= right) {
+                if (right != center) {
+                    s_mel_filterbank[m][k] = (right - freq_hz) / (right - center);
+                }
             }
         }
     }
 
-    // 3. Pre-calculate DCT-II Matrix
+    // 3. Pre-calculate DCT-II Matrix with ortho normalization to match torchaudio's
+    // default ``norm='ortho'`` behavior for the MFCC transform.
     for (int i = 0; i < NUM_MFCC_COEFS; i++) {
         for (int j = 0; j < NUM_MEL_FILTERS; j++) {
-            s_dct_matrix[i][j] = cosf((M_PI * i / NUM_MEL_FILTERS) * (j + 0.5f));
+            float angle = (M_PI / NUM_MEL_FILTERS) * (j + 0.5f) * i;
+            float base = cosf(angle);
+            s_dct_matrix[i][j] = (i == 0)
+                ? base * sqrtf(1.0f / NUM_MEL_FILTERS)
+                : base * sqrtf(2.0f / NUM_MEL_FILTERS);
         }
     }
 
@@ -175,68 +148,45 @@ void mfcc_dsp_init(void) {
 // ----------------------------------------------------------------------------
 // 3. Full Feature Extraction Process
 // ----------------------------------------------------------------------------
-void mfcc_compute(const int16_t* pcm_data, float* out_features) {
+void mfcc_compute_batch(const int16_t *pcm_data, float *out_features) {
     if (!s_dsp_initialized || pcm_data == NULL || out_features == NULL) {
         return;
     }
 
-    // Step 0: PCM Normalization + Digital Gain Boost (16.0x for PDM Mic)
-    float work_buf[FRAME_LEN];
-    for (size_t i = 0; i < FRAME_LEN; i++) {
-        float norm = ((float)pcm_data[i] / 32768.0f) * 16.0f;
-        // Hard clip to [-1.0, 1.0] bounds
-        if (norm > 1.0f) {
-            norm = 1.0f;
-        } else if (norm < -1.0f) {
-            norm = -1.0f;
+    float max_mel_db = -INFINITY;
+    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+        float real[FFT_SIZE] = {0};
+        float imag[FFT_SIZE] = {0};
+
+        for (int i = 0; i < FRAME_LEN; i++) {
+            real[i] = ((float)pcm_data[frame * FRAME_STEP + i] / 32768.0f) * s_window[i];
         }
-        work_buf[i] = norm;
-    }
 
-    // Step 1: Dynamic DC Offset Removal
-    dc_blocker_process(&s_dc_filter, work_buf, FRAME_LEN);
+        fft_radix2(real, imag, FFT_SIZE);
 
-    // Step 2: Pre-emphasis & Hamming Windowing
-    float real[FFT_SIZE];
-    float imag[FFT_SIZE];
-    memset(imag, 0, sizeof(imag));
-
-    real[0] = work_buf[0] * s_hamming_window[0];
-    for (size_t i = 1; i < FRAME_LEN; i++) {
-        float preemph = work_buf[i] - PREEMPH_ALPHA * work_buf[i - 1];
-        real[i] = preemph * s_hamming_window[i];
-    }
-    // Zero-pad frame from 400 to 512 points for FFT
-    for (size_t i = FRAME_LEN; i < FFT_SIZE; i++) {
-        real[i] = 0.0f;
-    }
-
-    // Step 3: Compute FFT
-    fft_radix2(real, imag, FFT_SIZE);
-
-    // Step 4: Compute Power Spectrum
-    float power_spectrum[(FFT_SIZE / 2) + 1];
-    for (int i = 0; i <= FFT_SIZE / 2; i++) {
-        power_spectrum[i] = (real[i] * real[i] + imag[i] * imag[i]) / FFT_SIZE;
-    }
-
-    // Step 5: Mel-Filter Bank Energies with Base-10 Decibel Log Scale
-    float mel_energies[NUM_MEL_FILTERS];
-    for (int m = 0; m < NUM_MEL_FILTERS; m++) {
-        float sum = 0.0f;
-        for (int k = 0; k <= FFT_SIZE / 2; k++) {
-            sum += power_spectrum[k] * s_mel_filterbank[m][k];
+        for (int m = 0; m < NUM_MEL_FILTERS; m++) {
+            float mel_power = 0.0f;
+            for (int k = 0; k <= FFT_SIZE / 2; k++) {
+                float power = real[k] * real[k] + imag[k] * imag[k];
+                mel_power += power * s_mel_filterbank[m][k];
+            }
+            s_mel_db[frame][m] = 10.0f * log10f(fmaxf(mel_power, 1.0e-10f));
+            if (s_mel_db[frame][m] > max_mel_db) {
+                max_mel_db = s_mel_db[frame][m];
+            }
         }
-        // Match standard PyTorch/Librosa dB log scaling: 10 * log10(sum + 1e-4)
-        mel_energies[m] = 10.0f * log10f(sum + 1e-4f);
     }
 
-    // Step 6: Discrete Cosine Transform (DCT-II) -> 13 MFCCs
-    for (int i = 0; i < NUM_MFCC_COEFS; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < NUM_MEL_FILTERS; j++) {
-            sum += mel_energies[j] * s_dct_matrix[i][j];
+    // Torchaudio MFCC uses AmplitudeToDB(top_db=80), whose threshold is based on
+    // the maximum Mel power in the complete input clip.
+    float mel_floor_db = max_mel_db - 80.0f;
+    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+        for (int coefficient = 0; coefficient < NUM_MFCC_COEFS; coefficient++) {
+            float sum = 0.0f;
+            for (int mel = 0; mel < NUM_MEL_FILTERS; mel++) {
+                sum += fmaxf(s_mel_db[frame][mel], mel_floor_db) * s_dct_matrix[coefficient][mel];
+            }
+            out_features[coefficient * NUM_FRAMES + frame] = sum;
         }
-        out_features[i] = sum;
     }
 }

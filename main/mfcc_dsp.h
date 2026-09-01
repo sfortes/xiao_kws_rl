@@ -13,6 +13,6 @@
 #define NUM_MFCC 13
 
 void mfcc_dsp_init(void);
-void mfcc_compute(const int16_t* pcm_data, float* out_features);
+void mfcc_compute_batch(const int16_t *pcm_data, float *out_features);
 
 #endif
