@@ -107,26 +107,6 @@ static inline float relu(float x) {
     return x > 0.0f ? x : 0.0f;
 }
 
-static void softmax(const float *input, float *output, int size) {
-    float max_val = input[0];
-    for (int i = 1; i < size; i++) {
-        if (input[i] > max_val) {
-            max_val = input[i];
-        }
-    }
-
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        output[i] = expf(input[i] - max_val);
-        sum += output[i];
-    }
-
-    float inv_sum = 1.0f / (sum + 1e-7f);
-    for (int i = 0; i < size; i++) {
-        output[i] *= inv_sum;
-    }
-}
-
 void kws_model_init(void) {
     if (s_is_initialized) {
         ESP_LOGI(TAG, "Model already initialized in PSRAM");

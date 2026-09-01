@@ -11,8 +11,6 @@
 #include "kws_model.h"
 #include "mfcc_dsp.h"
 
-#define NUM_MFCC_COEFS 13
-
 #define PDM_CLK_IO GPIO_NUM_42
 #define PDM_DIN_IO GPIO_NUM_41
 #define VAD_CHUNK_SAMPLES FRAME_STEP
