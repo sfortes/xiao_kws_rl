@@ -18,8 +18,8 @@
 #define VAD_CHUNK_SAMPLES FRAME_STEP
 #define VAD_PRE_ROLL_SAMPLES (SAMPLE_RATE / 4)
 #define VAD_CALIBRATION_CHUNKS 150
-#define VAD_TRIGGER_MARGIN 350.0f
-#define VAD_TRIGGER_PEAK_MULTIPLIER 1.20f
+#define VAD_TRIGGER_MARGIN 180.0f
+#define VAD_TRIGGER_PEAK_MULTIPLIER 1.10f
 #define VAD_RELEASE_MULTIPLIER 1.20f
 #define VAD_NOISE_ADAPT_RATE 0.02f
 #define VAD_REQUIRED_CHUNKS 2
@@ -41,11 +41,30 @@ static SemaphoreHandle_t xModelMutex = NULL;
 static i2s_chan_handle_t rx_chan = NULL;
 
 static float calculate_rms(const int16_t *samples, size_t sample_count) {
+    int64_t sum = 0;
+    for (size_t i = 0; i < sample_count; i++) {
+        sum += samples[i];
+    }
+
+    float mean = (float)sum / sample_count;
     double sum_squares = 0.0;
     for (size_t i = 0; i < sample_count; i++) {
-        sum_squares += (double)samples[i] * samples[i];
+        float centered_sample = samples[i] - mean;
+        sum_squares += (double)centered_sample * centered_sample;
     }
     return sqrtf((float)(sum_squares / sample_count));
+}
+
+static void remove_dc_offset(int16_t *samples, size_t sample_count) {
+    int64_t sum = 0;
+    for (size_t i = 0; i < sample_count; i++) {
+        sum += samples[i];
+    }
+
+    int32_t mean = (int32_t)(sum / (int64_t)sample_count);
+    for (size_t i = 0; i < sample_count; i++) {
+        samples[i] = (int16_t)((int32_t)samples[i] - mean);
+    }
 }
 
 static void update_vad_thresholds(float noise_floor, float noise_peak,
@@ -218,6 +237,7 @@ void vCore0_InferenceTask(void *pvParameters) {
         next_trigger_tick = xTaskGetTickCount() + pdMS_TO_TICKS(VAD_COOLDOWN_MS);
 
         if (captured_samples == AUDIO_LEN_SAMPLES) {
+            remove_dc_offset(raw_pcm, AUDIO_LEN_SAMPLES);
             float audio_rms = calculate_rms(raw_pcm, AUDIO_LEN_SAMPLES);
             ESP_LOGI(TAG, "[VAD] Triggered at %.2f RMS (threshold %.2f); classifying a 1.0 s clip",
                      chunk_rms, trigger_rms);
